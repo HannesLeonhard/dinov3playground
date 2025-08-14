@@ -139,7 +139,7 @@ The reader is referred to the associated paper for details on the evaluation pro
     <!-- <th>Dataset</th> -->
     <th>IN-ReaL</th>
     <th>IN-R</th>
-    <th>Obj.365</th>
+    <th>Obj.Net</th>
     <th>Ox.-H</th>
     <th>ADE20k</th>
     <th>NYU↓</th>
@@ -239,7 +239,7 @@ The reader is referred to the associated paper for details on the evaluation pro
     <th>Model</th>
     <th colspan="2">IN-ReaL</th>
     <th colspan="2">IN-R</th>
-    <th colspan="2">Obj.365</th>
+    <th colspan="2">Obj.Net</th>
     <th>ADE20k</th>
     <th>NYU↓</th>
   </tr>

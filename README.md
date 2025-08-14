@@ -29,6 +29,14 @@ An extended family of versatile vision foundation models producing high-quality 
 
 ## Pretrained models
 
+:information_source: Please follow the link provided below to get access to all the model weights: once accepted, an e-mail will be sent with the complete list of URLs pointing to all the available model weights (both backbones and adapters). These URLs can then be used to either:
+- download the model or adapter weights to a local filesystem and point `torch.hub.load()` to these local weights via the `weights` or `backbone_weights` parameters, or
+- directly invoke `torch.hub.load()` to download and load a backbone or an adapter from its URL via also the `weights` or `backbone_weights` parameters.
+
+See the example code snippets below.
+
+:warning: Please use `wget` instead of a web browser to download the weights.
+
 ViT models pretrained on web dataset (LVD-1689M):
 <table style="margin: auto">
   <thead>
