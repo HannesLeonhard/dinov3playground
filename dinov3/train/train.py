@@ -489,6 +489,7 @@ def do_train(cfg, model, resume=False):
 
             # Forward backward
             optimizer.zero_grad(set_to_none=True)
+            # TODO: Here we need the clustering
             total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
 
             # Gradient clipping

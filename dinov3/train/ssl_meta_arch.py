@@ -6,6 +6,8 @@
 import gc
 import logging
 from functools import partial
+from pathlib import Path
+import numpy as np
 
 import torch
 from omegaconf import OmegaConf
@@ -405,6 +407,16 @@ class SSLMetaArch(nn.Module):
         else:
             gram_global = {}
 
+        # Clustering
+        # Cluster based on local and global crops? Compare student and teacher clustering to each other?
+        images = data["collated_images"].cuda(non_blocking=True)
+        try:
+            # use_teacher=True uses EMA teacher (more stable); set to False to use student backbone
+            self.get_student_clustering(images=images, iteration=iteration, use_teacher=True, eps=0.6, min_samples=4)
+        except Exception as err:
+            logger.exception("Clustering invocation failed at iteration %s", iteration)
+            logger.exception(f"Unexpected {err=}, {type(err)=}")
+
         # Compute losses and backprop
         loss_accumulator, loss_dict = self.compute_losses(
             teacher_global=teacher_global,
@@ -520,6 +532,103 @@ class SSLMetaArch(nn.Module):
             "orig_student_patches": orig_student_patches,  # [n_crops * B, P, D]
             "orig_teacher_patches": orig_teacher_patches,  # [n_crops * B, P, D]
         }
+    
+    @torch.no_grad()
+    def get_student_clustering(
+        self,
+        *,
+        images: torch.Tensor | None,
+        iteration: int,
+        use_teacher: bool = False,
+        eps: float = 0.5,
+        min_samples: int = 5,
+        metric: str = "euclidean",
+    ):
+        """
+        Compute embeddings for the provided *whole* images, gather across ranks and run DBSCAN
+        on the main process. Saves embeddings and labels to:
+            <cfg.train.output_dir>/clustering/iter_<iteration>/
+
+        images: Tensor [B, C, H, W] or None
+        use_teacher: if True use `self.model_ema` (usually the teacher/ema); else use `self.student`
+        """
+        if images is None:
+            return
+
+        # decide which backbone to use. Both self.student and self.model_ema are ModuleDicts with a "backbone".
+        model_container = self.model_ema if use_teacher else self.student
+        if "backbone" not in model_container:
+            logger.warning("No backbone found in selected model container for clustering.")
+            return
+        backbone = model_container["backbone"]
+
+        # move images to the backbone device (they typically already are)
+        device = next(backbone.parameters()).device if any(True for _ in backbone.parameters()) else images.device
+        imgs = images.to(device, non_blocking=True)
+
+        # forward through backbone to get per-image class token embedding
+        try:
+            backbone_out = backbone(imgs, is_training=False)
+        except Exception as e:
+            logger.exception("Backbone forward failed during clustering: %s", e)
+            return
+        
+        if isinstance(backbone_out, torch.Tensor):
+            emb_local = backbone_out
+        else:
+            raise RuntimeError(f"Unexpected backbone output type: {type(backbone_out)}")
+
+        # Ensure float32 and contiguous
+        emb_local = emb_local.detach().contiguous().to(torch.float32)
+
+        # L2-normalize for stability
+        emb_local = torch.nn.functional.normalize(emb_local, p=2, dim=1)
+
+        # Gather across ranks (handles different sized tensors)
+        try:
+            gathered = distributed.gather_all_tensors(emb_local, group=None)  # list of tensors (per-rank)
+            all_emb = torch.cat(gathered, dim=0)  # (N_total, D)
+        except Exception:
+            # fallback to CPU cat
+            try:
+                gathered_cpu = [g.cpu() for g in distributed.gather_all_tensors(emb_local.cpu(), group=None)]
+                all_emb = torch.cat(gathered_cpu, dim=0)
+            except Exception as e:
+                logger.exception("Failed to gather embeddings for clustering: %s", e)
+                return
+
+        all_emb_np = all_emb.cpu().numpy()
+
+        # Run DBSCAN only on main process
+        if distributed.is_main_process():
+            try:
+                from sklearn.cluster import DBSCAN
+
+                db = DBSCAN(eps=eps, min_samples=min_samples, metric=metric, n_jobs=-1)
+                labels = db.fit_predict(all_emb_np)
+                n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+                n_noise = int((labels == -1).sum())
+
+                out_dir = Path(self.cfg.train.output_dir) / "clustering" / f"iter_{iteration}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+
+                np.save(out_dir / "embeddings.npy", all_emb_np)
+                np.save(out_dir / "dbscan_labels.npy", labels.astype(np.int32))
+                # lightweight meta
+                meta = {
+                    "n_points": int(all_emb_np.shape[0]),
+                    "n_clusters": int(n_clusters),
+                    "n_noise": int(n_noise),
+                    "eps": float(eps),
+                    "min_samples": int(min_samples),
+                    "use_teacher": bool(use_teacher),
+                }
+                np.save(out_dir / "meta.npy", meta)
+                logger.info(
+                    f"[Clustering] iter={iteration}: pts={meta['n_points']} clusters={meta['n_clusters']} noise={meta['n_noise']} -> {out_dir}"
+                )
+            except Exception as e:
+                logger.exception("DBSCAN failed in get_student_clustering at iteration %s: %s", iteration, e)
 
     def get_student_output(self, *, global_crops, local_crops, upperbound, masks, mask_indices_list):
         n_global_crops, B, rgb, H, W = global_crops.shape
