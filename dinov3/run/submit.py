@@ -28,7 +28,7 @@ def get_submitit_parser():
     parser = argparse.ArgumentParser("Submitit arguments", add_help=False)
     parser.add_argument(
         "--ngpus",
-        default=8,
+        default=1,
         type=int,
         help="Number of gpus to request on each node, default: %(default)s",
     )
