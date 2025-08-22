@@ -53,12 +53,12 @@ train:
   learn_from_teacher_tokens: false
   centering: sinkhorn_knopp
   checkpointing: false
-  compile: true
+  compile: false
   cudagraphs: false
   cell_augmentation: false
   cell_augmentation_type: hpa
 student:
-  arch: vit_large
+  arch: vit_small
   patch_size: 16
   drop_path_rate: 0.3
   layerscale: 1.0e-05
