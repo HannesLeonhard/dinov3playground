@@ -6,8 +6,6 @@ dist/
 **/.ipynb_checkpoints
 **/.ipynb_checkpoints/**
 
-**/notebooks
-
 # Ignore shell scripts
 *.sh
 
@@ -22,3 +20,7 @@ dist/
 
 # Ignore outputs
 /outputs*/
+
+# Dummy notebooks for initial exploration
+Untitled.ipynb
+Dataloader_example.ipynb
