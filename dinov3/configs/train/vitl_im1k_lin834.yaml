@@ -26,10 +26,15 @@ dino:
   force_weight_norm: false
 triplet:
   enabled: true
+  cluser_backbone: student
   margin: 0.2
   weight: 0.1
   clustering_eps: 0.002
   clustering_min_samples: 2
+  autoeps: true
+  autoeps_mode: "mean"    # "mean", "mean_minus_std", "mean_plus_std"
+  batch_hard: false       # Set to true to use batch-hard triplet mining
+  save_clustering: true
 ibot:
   loss_weight: 1.0
   mask_sample_probability: 0.5
@@ -45,12 +50,12 @@ ibot:
   head_nlayers: 3
   head_hidden_dim: 2048
 train:
-  batch_size_per_gpu: 64
+  batch_size_per_gpu: 128
   dataset_path: ImageNet:split=TRAIN
   output_dir: /checkpoint/dino/qas/rope/vitl16_im1k
   saveckp_freq: 20
   seed: 0
-  num_workers: 10
+  num_workers: 19
   OFFICIAL_EPOCH_LENGTH: 1250
   monitor_gradient_norm: false
   chunk_schedule: []

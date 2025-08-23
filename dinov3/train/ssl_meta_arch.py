@@ -354,7 +354,7 @@ class SSLMetaArch(nn.Module):
 
     def forward_backward(
         self, data, *, teacher_temp, iteration=0, **ignored_kwargs
-    ) -> tuple[Tensor, dict[str, float | Tensor]]:
+    ) -> tuple[Tensor, dict[str, float | Tensor], dict[str, float | Tensor]]:
         del ignored_kwargs
         metrics_dict = {}
 
@@ -416,10 +416,11 @@ class SSLMetaArch(nn.Module):
         images = data["collated_images"].cuda(non_blocking=True)
         try:
             # TODO: What hyperparameters
-            all_emb, all_labels, local_indices = self.get_student_clustering(
+            use_teacher = True if self.cfg.triplet.get("cluster_backbone", "teacher") == "teacher" else False
+            all_emb, all_labels, local_indices = self.get_clustering(
                 images=images,
                 iteration=iteration,
-                use_teacher=True,   # teacher/ema -> stable targets
+                use_teacher=use_teacher,   # teacher/ema -> stable targets
                 eps=self.cfg.triplet.get("clustering_eps", 0.6),
                 min_samples=self.cfg.triplet.get("clustering_min_samples", 4),
             )
@@ -445,8 +446,8 @@ class SSLMetaArch(nn.Module):
 
         self.backprop_loss(loss_accumulator)
 
-        # Return total weighted loss and a dict of metrics to log
-        return loss_accumulator, metrics_dict | loss_dict
+        # Return total weighted loss, a dict of metrics to log and the los dict
+        return loss_accumulator, metrics_dict, loss_dict
 
     @torch.no_grad()
     def get_teacher_output(
@@ -632,7 +633,16 @@ class SSLMetaArch(nn.Module):
             try:
                 all_emb_np = all_emb.cpu().numpy()
                 from sklearn.cluster import DBSCAN
+                from sklearn.metrics import pairwise_distances
 
+                dists = pairwise_distances(all_emb_np, metric=metric)
+                # Take only upper triangle (to avoid double counting and zeros)
+                triu = dists[np.triu_indices_from(dists, k=1)]
+                mean_dist = triu.mean()
+                std_dist = triu.std()
+                eps = mean_dist - std_dist
+                if eps < 0:
+                    eps = mean_dist
                 db = DBSCAN(eps=eps, min_samples=min_samples, metric=metric, n_jobs=-1)
                 labels = db.fit_predict(all_emb_np)  # numpy array length N_total: ints
                 # convert to tensor on device and broadcast to all ranks
@@ -836,41 +846,58 @@ class SSLMetaArch(nn.Module):
                     loss_dict["stats_only/unmasked_gram_loss"] = gram_loss_unmasked
 
         # inside compute_losses, where triplet_emb, triplet_labels, triplet_local_indices are available
+        # triplet loss
         if getattr(self.cfg, "triplet", None) and self.cfg.triplet.enabled and triplet_labels is not None and triplet_emb is not None and triplet_local_indices is not None:
             try:
-                # TODO: What are the local anchors
                 # anchors: student embeddings (global crop 0). Keep gradient on student anchors.
-                # student_global["cls_pre_head"] shape: [n_global_crops, B, D]
+                # student_global["cls_pre_head"] shape: [n_global_crops, B_local, D]
                 student_anchors = student_global["cls_pre_head"][0]  # [B_local, D]
 
-                # Build a deterministic seed: use iteration + rank*10000 -> reproducible across runs.
-                # If you want the same sampling across ranks for the *same* anchors, use only iteration as seed.
+                # deterministic seed using iteration + rank*const
                 rank = distributed.get_rank() if hasattr(distributed, "get_rank") else 0
-                seed = int(iteration) + int(rank) * 10000
+                seed = int(iteration) + int(rank) * 10007
 
-                triplet_loss_val = self.triplet_loss(
+                # mode selection from cfg: batch-hard if cfg.triplet.batch_hard True
+                mode = "batch_hard" if self.cfg.triplet.get("batch_hard", False) else "sample"
+
+                triplet_loss_val, triplet_stats = self.triplet_loss(
                     anchors=student_anchors,
                     global_emb=triplet_emb,
                     global_labels=triplet_labels,
                     local_indices=triplet_local_indices,
                     margin=float(self.cfg.triplet.get("margin", self.triplet_loss.margin)),
                     seed=seed,
+                    mode=mode,
                 )
 
+                # add scalar loss
                 loss_dict["triplet_loss"] = triplet_loss_val
                 loss_accumulator += float(self.cfg.triplet.weight) * triplet_loss_val
+                # record stats (valid anchors / total), move to python ints for logging/storage
+                valid_count = int(triplet_stats.get("valid_count", 0))
+                total_anchors = int(triplet_stats.get("total_anchors", student_anchors.shape[0]))
+                loss_dict["triplet/valid_anchors"] = valid_count
+                loss_dict["triplet/total_anchors"] = total_anchors
+                loss_dict["triplet/mode"] = triplet_stats.get("mode", mode)
+                # log once per iteration on main process
+                logger.info(f"[Triplet] iter={iteration}: mode={loss_dict['triplet/mode']} valid_anchors={valid_count}/{total_anchors}")
+
             except Exception as err:
                 logger.exception("Triplet loss failed at iteration %s", iteration)
                 logger.exception(f"Unexpected {err=}, {type(err)=}")
-
+        else:
+            loss_dict["triplet_loss"] = 0
+            loss_dict["triplet/valid_anchors"] = 0
+            loss_dict["triplet/total_anchors"] = 0
+            loss_dict["triplet/mode"] = "NaN"
 
         return loss_accumulator, loss_dict
     
 # Questions to talk about
 # - Use use_teacher=True for clustering because EMA/teacher embeddings are stable (less noisy clustering). The EMA teacher changes slowly and therefore produces cluster assignments that vary less across iterations — that helps DBSCAN produce sensible clusters instead of oscillating.
 # - Triplet anchors are the student embeddings because we need gradients to update the student. The loss must produce gradients for the network parameters we train. The EMA teacher is typically requires_grad=False (or detached); if you used teacher embeddings as anchors you would not get gradients to update the student (or you'd have to create a new computational graph that forces gradient flow through student in a different way). So the usual pattern is: teacher creates stable clusters/targets, student is trained against them.
-# - Perform clustering on the whole images, or local/global crops?
-# - DBSCAN eps selection matters; heuristics (mean distance ± std)?
+# - Perform clustering on the whole images, or local/global crops? -> global image
+# - DBSCAN eps selection matters; heuristics (mean distance ± std)?  -> Find eps s.t. only one cluster and then decrease until B//2 clusters
 # - If clusters are tiny/rare, triplet signals may be sparse. Small batchsizes make stuff weird
 # - If we scale to very many samples (e.g., whole dataset clustering every epoch), then the memory / compute for DBSCAN may become large
 

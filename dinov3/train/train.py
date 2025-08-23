@@ -490,7 +490,7 @@ def do_train(cfg, model, resume=False):
             # Forward backward
             optimizer.zero_grad(set_to_none=True)
             # TODO: Here we need the clustering
-            total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
+            total_loss, metrics_dict, loss_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
 
             # Gradient clipping
             if cfg.optim.clip_grad:
@@ -558,6 +558,14 @@ def do_train(cfg, model, resume=False):
                 "mom": mom,
                 "last_layer_lr": last_layer_lr,
                 "total_loss": total_loss,
+                "dino_local_crops_loss": loss_dict["dino_local_crops_loss"],
+                "dino_global_crops_loss": loss_dict["dino_global_crops_loss"],
+                "koleo_loss": loss_dict["koleo_loss"],
+                "ibot_loss": loss_dict["ibot_loss"],
+                #"gram_loss": loss_dict["gram_loss"],
+                "triplet_loss": loss_dict["triplet_loss"],
+                "triplet/valid_anchors": loss_dict["triplet/valid_anchors"],
+                "triplet/total_anchors": loss_dict["triplet/total_anchors"]
             })
             metric_logger.update(lr=lr)
             metric_logger.update(wd=wd)
