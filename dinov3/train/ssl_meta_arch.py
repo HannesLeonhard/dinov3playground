@@ -19,7 +19,7 @@ from dinov3.configs import get_default_config
 from dinov3.data import DataAugmentationDINO
 from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
 from dinov3.layers.dino_head import DINOHead
-from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss, TripletLoss
+from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss, TripletLoss, TripletCentroidLoss
 from dinov3.models import build_model_from_cfg
 from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
@@ -83,7 +83,8 @@ class SSLMetaArch(nn.Module):
         teacher_model_dict["dino_head"] = dino_head_class()
         self.dino_loss = DINOLoss(self.dino_out_dim)
         if self.cfg.get("triplet", None) and self.cfg.triplet.enabled:
-            self.triplet_loss = TripletLoss(self.cfg.triplet.get("margin", 0.2))
+            self.triplet_centroid_loss = TripletCentroidLoss(self.cfg.triplet.get("margin", 0.2))
+            # self.triplet_loss = TripletLoss(self.cfg.triplet.get("margin", 0.2))
         else:
             self.triplet_loss = None
 
@@ -417,17 +418,18 @@ class SSLMetaArch(nn.Module):
         try:
             # TODO: What hyperparameters
             use_teacher = True if self.cfg.triplet.get("cluster_backbone", "teacher") == "teacher" else False
-            all_emb, all_labels, local_indices = self.get_clustering(
+            # all_emb, all_labels, local_indices = self.get_clustering(images=images,iteration=iteration,use_teacher=use_teacher,eps=self.cfg.triplet.get("clustering_eps", 0.6),min_samples=self.cfg.triplet.get("clustering_min_samples", 4))
+            all_emb, labels_per_eps, centroids_per_eps, centroid_labels_per_eps, local_indices = self.get_hierachical_clustering(
                 images=images,
                 iteration=iteration,
-                use_teacher=use_teacher,   # teacher/ema -> stable targets
-                eps=self.cfg.triplet.get("clustering_eps", 0.6),
-                min_samples=self.cfg.triplet.get("clustering_min_samples", 4),
+                use_teacher=use_teacher,
+                min_samples=5,
+                metric="euclidean"
             )
         except Exception as err:
             logger.exception("Clustering invocation failed at iteration %s", iteration)
             logger.exception(f"Unexpected {err=}, {type(err)=}")
-            all_emb, all_labels, local_indices = None, None, None
+            all_emb, labels_per_eps, centroids_per_eps, centroid_labels_per_eps, local_indices = None, None, None, None, None
 
         # Compute losses and backprop
         loss_accumulator, loss_dict = self.compute_losses(
@@ -440,8 +442,10 @@ class SSLMetaArch(nn.Module):
             masks_weight=masks_weight,
             iteration=iteration,
             triplet_emb=all_emb,
-            triplet_labels=all_labels,
             triplet_local_indices=local_indices,
+            triplet_centroids=centroids_per_eps,
+            triplet_centroid_labels=centroid_labels_per_eps,
+            triplet_labels_per_eps_tensor=labels_per_eps
         )
 
         self.backprop_loss(loss_accumulator)
@@ -687,6 +691,181 @@ class SSLMetaArch(nn.Module):
                 labels_tensor = cpu_labels.to(all_emb.device)
 
         return all_emb, labels_tensor, local_indices
+    
+    # TODO: EPS schdeule, ignore noise points
+    @torch.no_grad()
+    def get_hierachical_clustering(
+        self,
+        *,
+        images: torch.Tensor | None,
+        iteration: int,
+        use_teacher: bool = False,
+        min_samples: int = 5,
+        metric: str = "euclidean",
+    ):
+        """
+        Compute embeddings for the provided *whole* images, gather across ranks and run DBSCAN at
+        three eps levels: [mean - std, mean, mean + std].
+        Returns:
+            all_emb: Tensor (N_total, D) -- gathered embeddings (on device)
+            labels_per_eps: LongTensor (L, N_total) -- DBSCAN labels per eps (L=3)
+            centroids_per_eps: list of L tensors, each (n_clusters_j, D) on same device as all_emb
+            centroid_labels_per_eps: list of L 1D tensors with the corresponding cluster labels
+            local_indices: LongTensor (n_local,) -- indices inside all_emb for this rank's samples
+        """
+        if images is None:
+            return None, None, None, None, None
+
+        # select model container (teacher recommended for stability)
+        model_container = self.model_ema if use_teacher else self.student
+        if "backbone" not in model_container:
+            logger.warning("No backbone found in selected model container for clustering.")
+            return None, None, None, None, None
+        backbone = model_container["backbone"]
+
+        # device for backbone
+        device = next(backbone.parameters()).device if any(True for _ in backbone.parameters()) else images.device
+        imgs = images.to(device, non_blocking=True)
+
+        # get per-rank embeddings
+        try:
+            backbone_out = backbone(imgs, is_training=False)
+        except Exception as e:
+            logger.exception("Backbone forward failed during clustering: %s", e)
+            return None, None, None, None, None
+
+        # support backbone returning either a tensor (B, D) or a dict/list
+        if isinstance(backbone_out, torch.Tensor):
+            emb_local = backbone_out  # [B_local, D]
+        elif isinstance(backbone_out, dict) and "x_norm_clstoken" in backbone_out:
+            emb_local = backbone_out["x_norm_clstoken"]
+        elif isinstance(backbone_out, (list, tuple)) and len(backbone_out) > 0 and isinstance(backbone_out[0], dict):
+            emb_local = backbone_out[0]["x_norm_clstoken"]
+        else:
+            logger.exception("Unexpected backbone return structure for clustering.")
+            return None, None, None, None, None
+
+        emb_local = emb_local.detach().contiguous().to(torch.float32)  # [B_local, D]
+        emb_local = torch.nn.functional.normalize(emb_local, p=2, dim=1)
+
+        # Gather per-rank embeddings: list of tensors [emb_rank0, emb_rank1, ...]; each rank obtains this list
+        try:
+            gathered = distributed.gather_all_tensors(emb_local, group=None)  # list
+        except Exception:
+            # fallback to CPU gather then cat
+            try:
+                gathered = [g.cpu() for g in distributed.gather_all_tensors(emb_local.cpu(), group=None)]
+            except Exception as e:
+                logger.exception("Failed to gather embeddings for clustering: %s", e)
+                return None, None, None, None, None
+
+        # Build all_emb on this rank
+        all_emb = torch.cat(gathered, dim=0)  # (N_total, D)
+        N_total = all_emb.shape[0]
+
+        # compute where our local rows are in the concatenation
+        rank = distributed.get_rank()
+        offset = 0
+        for r in range(rank):
+            offset += gathered[r].shape[0]
+        local_len = emb_local.shape[0]
+        local_indices = torch.arange(offset, offset + local_len, dtype=torch.long, device=all_emb.device)
+
+        # On main process compute pairwise distances statistics and run DBSCAN for three eps
+        L = 3  # three eps levels: mean-std, mean, mean+std
+        labels_list = [None] * L
+        if distributed.is_main_process():
+            try:
+                all_emb_np = all_emb.cpu().numpy()
+                from sklearn.cluster import DBSCAN
+                from sklearn.metrics import pairwise_distances
+
+                dists = pairwise_distances(all_emb_np, metric=metric)
+                # upper triangle excluding diagonal
+                triu = dists[np.triu_indices_from(dists, k=1)]
+                mean_dist = float(triu.mean()) if triu.size > 0 else float(dists.mean())
+                std_dist = float(triu.std()) if triu.size > 0 else float(dists.std())
+
+                eps_vals = [max(1e-6, mean_dist - std_dist), max(1e-6, mean_dist), max(1e-6, mean_dist + std_dist)]
+                for i, eps_i in enumerate(eps_vals):
+                    db = DBSCAN(eps=eps_i, min_samples=min_samples, metric=metric, n_jobs=-1)
+                    labels = db.fit_predict(all_emb_np)  # numpy array length N_total: ints
+                    labels_list[i] = labels.astype(np.int64)
+                # optional debug saving
+                meta = {
+                    "n_points": int(N_total),
+                    "eps_vals": eps_vals,
+                    "min_samples": int(min_samples),
+                    "use_teacher": bool(use_teacher),
+                }
+                if self.cfg.triplet.save_clustering:
+                    out_dir = Path(self.cfg.train.output_dir) / "clustering" / f"iter_{iteration}"
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    np.save(out_dir / "embeddings.npy", all_emb_np)
+                    for i, lab in enumerate(labels_list):
+                        np.save(out_dir / f"dbscan_labels_eps{i}.npy", lab.astype(np.int32))
+                    np.save(out_dir / "meta.npy", meta)
+                    logger.info(f"[Clustering] iter={iteration}: pts={meta['n_points']} eps={eps_vals} -> {out_dir}")
+            except Exception as e:
+                logger.exception("DBSCAN failed in get_clustering at iteration %s: %s", iteration, e)
+                labels_list = [np.full((N_total,), -1, dtype=np.int64) for _ in range(L)]
+        # Broadcast each labels_list[i] from main to every rank. Create torch tensors for broadcast.
+        labels_per_eps = torch.empty((L, N_total), dtype=torch.int64, device=all_emb.device)
+        for i in range(L):
+            if distributed.is_main_process():
+                lab_np = labels_list[i]
+                lab_tensor = torch.from_numpy(lab_np).to(all_emb.device, dtype=torch.int64)
+            else:
+                lab_tensor = torch.empty((N_total,), dtype=torch.int64, device=all_emb.device)
+            # broadcast (works for GPU tensors when using NCCL) from rank 0
+            try:
+                torch.distributed.broadcast(lab_tensor, src=0)
+            except Exception:
+                # fallback to CPU broadcast if needed
+                cpu_tensor = lab_tensor.cpu()
+                torch.distributed.broadcast(cpu_tensor, src=0)
+                lab_tensor = cpu_tensor.to(all_emb.device)
+            labels_per_eps[i] = lab_tensor
+
+        # Now compute centroids on every rank locally from all_emb and labels_per_eps
+        centroids_per_eps = []
+        centroid_labels_per_eps = []
+        for i in range(L):
+            lab_tensor = labels_per_eps[i]  # (N_total,)
+            # ignore noise
+            mask = lab_tensor != -1
+            if mask.sum().item() == 0:
+                centroids_per_eps.append(torch.empty((0, all_emb.shape[1]), dtype=all_emb.dtype, device=all_emb.device))
+                centroid_labels_per_eps.append(torch.empty((0,), dtype=torch.int64, device=all_emb.device))
+                continue
+            labels_i = lab_tensor.cpu().numpy()
+            unique_labels = np.unique(labels_i[labels_i != -1])
+            centroids = []
+            cent_labels = []
+            for lab in unique_labels:
+                # boolean mask (on CPU or device)
+                idxs = np.nonzero(labels_i == int(lab))[0]
+                if idxs.size == 0:
+                    continue
+                # compute centroid in torch for numerical stability
+                rows = all_emb[idxs]  # (n_i, D)
+                centroid = rows.mean(dim=0)
+                centroids.append(centroid)
+                cent_labels.append(int(lab))
+            if len(centroids) == 0:
+                centroids_tensor = torch.empty((0, all_emb.shape[1]), dtype=all_emb.dtype, device=all_emb.device)
+                cent_label_tensor = torch.empty((0,), dtype=torch.int64, device=all_emb.device)
+            else:
+                centroids_tensor = torch.stack(centroids, dim=0)  # (n_clusters_i, D)
+                cent_label_tensor = torch.tensor(cent_labels, dtype=torch.int64, device=all_emb.device)
+            # normalize centroids (cosine)
+            if centroids_tensor.numel() > 0:
+                centroids_tensor = torch.nn.functional.normalize(centroids_tensor, p=2, dim=1)
+            centroids_per_eps.append(centroids_tensor)
+            centroid_labels_per_eps.append(cent_label_tensor)
+
+        return all_emb, labels_per_eps, centroids_per_eps, centroid_labels_per_eps, local_indices
+
 
     def get_student_output(self, *, global_crops, local_crops, upperbound, masks, mask_indices_list):
         n_global_crops, B, rgb, H, W = global_crops.shape
@@ -754,8 +933,10 @@ class SSLMetaArch(nn.Module):
         masks_weight,
         iteration,
         triplet_emb,
-        triplet_labels,
         triplet_local_indices,
+        triplet_centroids,
+        triplet_centroid_labels,
+        triplet_labels_per_eps_tensor
     ):
         n_global_crops = student_global["cls_after_head"].shape[0]
         n_local_crops = student_local["cls_after_head"].shape[0]
@@ -847,7 +1028,7 @@ class SSLMetaArch(nn.Module):
 
         # inside compute_losses, where triplet_emb, triplet_labels, triplet_local_indices are available
         # triplet loss
-        if getattr(self.cfg, "triplet", None) and self.cfg.triplet.enabled and triplet_labels is not None and triplet_emb is not None and triplet_local_indices is not None:
+        if getattr(self.cfg, "triplet", None) and self.cfg.triplet.enabled:
             try:
                 # anchors: student embeddings (global crop 0). Keep gradient on student anchors.
                 # student_global["cls_pre_head"] shape: [n_global_crops, B_local, D]
@@ -860,31 +1041,33 @@ class SSLMetaArch(nn.Module):
                 # mode selection from cfg: batch-hard if cfg.triplet.batch_hard True
                 mode = "batch_hard" if self.cfg.triplet.get("batch_hard", False) else "sample"
 
-                triplet_loss_val, triplet_stats = self.triplet_loss(
+                triplet_loss_val, triplet_stats = self.triplet_centroid_loss(
                     anchors=student_anchors,
-                    global_emb=triplet_emb,
-                    global_labels=triplet_labels,
+                    centroids_per_eps=triplet_centroids,
+                    centroid_labels_per_eps=triplet_centroid_labels,
+                    labels_per_eps=triplet_labels_per_eps_tensor,
                     local_indices=triplet_local_indices,
-                    margin=float(self.cfg.triplet.get("margin", self.triplet_loss.margin)),
-                    seed=seed,
-                    mode=mode,
+                    margin=float(self.cfg.triplet.get("margin", self.triplet_centroid_loss.margin)),
                 )
-
-                # add scalar loss
+                # triplet_loss_val, triplet_stats = self.triplet_loss(anchors=student_anchors,global_emb=triplet_emb,global_labels=triplet_labels,local_indices=triplet_local_indices,margin=float(self.cfg.triplet.get("margin", self.triplet_loss.margin)),seed=seed,mode=mode,)
                 loss_dict["triplet_loss"] = triplet_loss_val
                 loss_accumulator += float(self.cfg.triplet.weight) * triplet_loss_val
-                # record stats (valid anchors / total), move to python ints for logging/storage
+
+                # record stats
                 valid_count = int(triplet_stats.get("valid_count", 0))
                 total_anchors = int(triplet_stats.get("total_anchors", student_anchors.shape[0]))
                 loss_dict["triplet/valid_anchors"] = valid_count
                 loss_dict["triplet/total_anchors"] = total_anchors
-                loss_dict["triplet/mode"] = triplet_stats.get("mode", mode)
-                # log once per iteration on main process
+                loss_dict["triplet/mode"] = "centroid" if self.cfg.triplet.get("centroid", False) else triplet_stats.get("mode", "sample")
                 logger.info(f"[Triplet] iter={iteration}: mode={loss_dict['triplet/mode']} valid_anchors={valid_count}/{total_anchors}")
 
             except Exception as err:
                 logger.exception("Triplet loss failed at iteration %s", iteration)
                 logger.exception(f"Unexpected {err=}, {type(err)=}")
+                loss_dict["triplet_loss"] = 0
+                loss_dict["triplet/valid_anchors"] = 0
+                loss_dict["triplet/total_anchors"] = 0
+                loss_dict["triplet/mode"] = "NaN"
         else:
             loss_dict["triplet_loss"] = 0
             loss_dict["triplet/valid_anchors"] = 0

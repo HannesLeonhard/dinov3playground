@@ -33,8 +33,9 @@ triplet:
   clustering_min_samples: 2
   autoeps: true
   autoeps_mode: "mean"    # "mean", "mean_minus_std", "mean_plus_std"
-  batch_hard: false       # Set to true to use batch-hard triplet mining
-  save_clustering: true
+  batch_hard: false       # legacy option when centroid=false
+  save_clustering: false
+  centroid: true                # if true, use centroid-based triplet
 ibot:
   loss_weight: 1.0
   mask_sample_probability: 0.5
