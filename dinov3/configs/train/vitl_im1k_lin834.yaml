@@ -24,6 +24,12 @@ dino:
   koleo_topk: 1
   koleo_distributed_replicas: 0
   force_weight_norm: false
+triplet:
+  enabled: true
+  margin: 0.2
+  weight: 0.1
+  clustering_eps: 0.002
+  clustering_min_samples: 2
 ibot:
   loss_weight: 1.0
   mask_sample_probability: 0.5

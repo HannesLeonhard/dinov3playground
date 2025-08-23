@@ -19,7 +19,7 @@ from dinov3.configs import get_default_config
 from dinov3.data import DataAugmentationDINO
 from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
 from dinov3.layers.dino_head import DINOHead
-from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss
+from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss, TripletLoss
 from dinov3.models import build_model_from_cfg
 from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
@@ -82,6 +82,10 @@ class SSLMetaArch(nn.Module):
         student_model_dict["dino_head"] = dino_head_class()
         teacher_model_dict["dino_head"] = dino_head_class()
         self.dino_loss = DINOLoss(self.dino_out_dim)
+        if self.cfg.get("triplet", None) and self.cfg.triplet.enabled:
+            self.triplet_loss = TripletLoss(self.cfg.triplet.get("margin", 0.2))
+        else:
+            self.triplet_loss = None
 
         logger.info("OPTIONS -- KOLEO")
         logger.info(f"OPTIONS -- KOLEO -- loss_weight: {cfg.dino.koleo_loss_weight}")
@@ -411,11 +415,18 @@ class SSLMetaArch(nn.Module):
         # Cluster based on local and global crops? Compare student and teacher clustering to each other?
         images = data["collated_images"].cuda(non_blocking=True)
         try:
-            # use_teacher=True uses EMA teacher (more stable); set to False to use student backbone
-            self.get_student_clustering(images=images, iteration=iteration, use_teacher=True, eps=0.6, min_samples=4)
+            # TODO: What hyperparameters
+            all_emb, all_labels, local_indices = self.get_student_clustering(
+                images=images,
+                iteration=iteration,
+                use_teacher=True,   # teacher/ema -> stable targets
+                eps=self.cfg.triplet.get("clustering_eps", 0.6),
+                min_samples=self.cfg.triplet.get("clustering_min_samples", 4),
+            )
         except Exception as err:
             logger.exception("Clustering invocation failed at iteration %s", iteration)
             logger.exception(f"Unexpected {err=}, {type(err)=}")
+            all_emb, all_labels, local_indices = None, None, None
 
         # Compute losses and backprop
         loss_accumulator, loss_dict = self.compute_losses(
@@ -427,6 +438,9 @@ class SSLMetaArch(nn.Module):
             mask_indices_list=mask_indices_list,
             masks_weight=masks_weight,
             iteration=iteration,
+            triplet_emb=all_emb,
+            triplet_labels=all_labels,
+            triplet_local_indices=local_indices,
         )
 
         self.backprop_loss(loss_accumulator)
@@ -534,7 +548,7 @@ class SSLMetaArch(nn.Module):
         }
     
     @torch.no_grad()
-    def get_student_clustering(
+    def get_clustering(
         self,
         *,
         images: torch.Tensor | None,
@@ -545,90 +559,124 @@ class SSLMetaArch(nn.Module):
         metric: str = "euclidean",
     ):
         """
-        Compute embeddings for the provided *whole* images, gather across ranks and run DBSCAN
-        on the main process. Saves embeddings and labels to:
-            <cfg.train.output_dir>/clustering/iter_<iteration>/
-
-        images: Tensor [B, C, H, W] or None
-        use_teacher: if True use `self.model_ema` (usually the teacher/ema); else use `self.student`
+        Compute embeddings for the provided *whole* images, gather across ranks and run DBSCAN.
+        Returns:
+            all_emb: Tensor (N_total, D) -- gathered embeddings (on device)
+            labels_tensor: LongTensor (N_total,) -- cluster labels (-1 => noise)
+            local_indices: LongTensor (n_local, ) -- indices inside all_emb that correspond to this rank's samples
         """
+        # TODO:
+        # - Use student or teacher? Whole image embeddings? What should be eps?
         if images is None:
-            return
+            return None, None, None
 
-        # decide which backbone to use. Both self.student and self.model_ema are ModuleDicts with a "backbone".
+        # select model container (teacher recommended for stability)
         model_container = self.model_ema if use_teacher else self.student
         if "backbone" not in model_container:
             logger.warning("No backbone found in selected model container for clustering.")
-            return
+            return None, None, None
         backbone = model_container["backbone"]
 
-        # move images to the backbone device (they typically already are)
+        # device for backbone
         device = next(backbone.parameters()).device if any(True for _ in backbone.parameters()) else images.device
         imgs = images.to(device, non_blocking=True)
 
-        # forward through backbone to get per-image class token embedding
+        # get per-rank embeddings
         try:
             backbone_out = backbone(imgs, is_training=False)
         except Exception as e:
             logger.exception("Backbone forward failed during clustering: %s", e)
-            return
-        
+            return None, None, None
+
+        # support backbone returning either a tensor (B, D) or a dict/list (we handled before)
         if isinstance(backbone_out, torch.Tensor):
-            emb_local = backbone_out
+            emb_local = backbone_out  # [B_local, D]
+        elif isinstance(backbone_out, dict) and "x_norm_clstoken" in backbone_out:
+            emb_local = backbone_out["x_norm_clstoken"]
+        elif isinstance(backbone_out, (list, tuple)) and len(backbone_out) > 0 and isinstance(backbone_out[0], dict):
+            emb_local = backbone_out[0]["x_norm_clstoken"]
         else:
-            raise RuntimeError(f"Unexpected backbone output type: {type(backbone_out)}")
+            logger.exception("Unexpected backbone return structure for clustering.")
+            return None, None, None
 
-        # Ensure float32 and contiguous
-        emb_local = emb_local.detach().contiguous().to(torch.float32)
-
-        # L2-normalize for stability
+        emb_local = emb_local.detach().contiguous().to(torch.float32)  # [B_local, D]
         emb_local = torch.nn.functional.normalize(emb_local, p=2, dim=1)
 
-        # Gather across ranks (handles different sized tensors)
+        # Gather per-rank embeddings: this returns a list of tensors [emb_rank0, emb_rank1, ...]
         try:
-            gathered = distributed.gather_all_tensors(emb_local, group=None)  # list of tensors (per-rank)
-            all_emb = torch.cat(gathered, dim=0)  # (N_total, D)
+            gathered = distributed.gather_all_tensors(emb_local, group=None)  # list
         except Exception:
-            # fallback to CPU cat
+            # fallback to CPU gather then cat
             try:
-                gathered_cpu = [g.cpu() for g in distributed.gather_all_tensors(emb_local.cpu(), group=None)]
-                all_emb = torch.cat(gathered_cpu, dim=0)
+                gathered = [g.cpu() for g in distributed.gather_all_tensors(emb_local.cpu(), group=None)]
             except Exception as e:
                 logger.exception("Failed to gather embeddings for clustering: %s", e)
-                return
+                return None, None, None
 
-        all_emb_np = all_emb.cpu().numpy()
+        # Build all_emb on this rank
+        all_emb = torch.cat(gathered, dim=0)  # (N_total, D)
+        N_total = all_emb.shape[0]
 
-        # Run DBSCAN only on main process
+        # compute where our local rows are in the concatenation
+        rank = distributed.get_rank()
+        # compute offset by summing sizes of earlier ranks
+        offset = 0
+        for r in range(rank):
+            offset += gathered[r].shape[0]
+        local_len = emb_local.shape[0]
+        local_indices = torch.arange(offset, offset + local_len, dtype=torch.long, device=all_emb.device)
+
+        # Run DBSCAN on main process
+        labels_tensor = None
         if distributed.is_main_process():
             try:
+                all_emb_np = all_emb.cpu().numpy()
                 from sklearn.cluster import DBSCAN
 
                 db = DBSCAN(eps=eps, min_samples=min_samples, metric=metric, n_jobs=-1)
-                labels = db.fit_predict(all_emb_np)
-                n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-                n_noise = int((labels == -1).sum())
-
+                labels = db.fit_predict(all_emb_np)  # numpy array length N_total: ints
+                # convert to tensor on device and broadcast to all ranks
+                try:
+                    labels_tensor = torch.from_numpy(labels).to(all_emb.device, dtype=torch.int64)
+                    # broadcast (works if backend supports tensors on this device)
+                    torch.distributed.broadcast(labels_tensor, src=0)
+                except Exception:
+                    # fallback: broadcast CPU tensor and move to device
+                    cpu_labels = torch.from_numpy(labels).to(torch.int64)
+                    torch.distributed.broadcast(cpu_labels, src=0)
+                    labels_tensor = cpu_labels.to(all_emb.device)
+                # (optional) save to disk for debugging; but you said no disk reliance
                 out_dir = Path(self.cfg.train.output_dir) / "clustering" / f"iter_{iteration}"
                 out_dir.mkdir(parents=True, exist_ok=True)
-
-                np.save(out_dir / "embeddings.npy", all_emb_np)
+                np.save(out_dir / "embeddings.npy", all_emb.cpu().numpy())
                 np.save(out_dir / "dbscan_labels.npy", labels.astype(np.int32))
-                # lightweight meta
                 meta = {
-                    "n_points": int(all_emb_np.shape[0]),
-                    "n_clusters": int(n_clusters),
-                    "n_noise": int(n_noise),
+                    "n_points": int(N_total),
+                    "n_clusters": int(len(set(labels)) - (1 if -1 in labels else 0)),
+                    "n_noise": int((labels == -1).sum()),
                     "eps": float(eps),
                     "min_samples": int(min_samples),
                     "use_teacher": bool(use_teacher),
                 }
                 np.save(out_dir / "meta.npy", meta)
-                logger.info(
-                    f"[Clustering] iter={iteration}: pts={meta['n_points']} clusters={meta['n_clusters']} noise={meta['n_noise']} -> {out_dir}"
-                )
+                logger.info(f"[Clustering] iter={iteration}: pts={meta['n_points']} clusters={meta['n_clusters']} noise={meta['n_noise']} -> {out_dir}")
             except Exception as e:
                 logger.exception("DBSCAN failed in get_student_clustering at iteration %s: %s", iteration, e)
+                labels_tensor = None
+        else:
+            # non-main ranks must create a placeholder and receive broadcast
+            # Create a placeholder same shape and dtype as expected
+            # We'll allocate on the same device as all_emb (then the broadcast above works), with zeros
+            labels_tensor = torch.empty((N_total,), dtype=torch.int64, device=all_emb.device)
+            try:
+                torch.distributed.broadcast(labels_tensor, src=0)
+            except Exception:
+                # fallback to CPU broadcast: make CPU placeholder, then receive, then move to device
+                cpu_labels = torch.empty((N_total,), dtype=torch.int64)
+                torch.distributed.broadcast(cpu_labels, src=0)
+                labels_tensor = cpu_labels.to(all_emb.device)
+
+        return all_emb, labels_tensor, local_indices
 
     def get_student_output(self, *, global_crops, local_crops, upperbound, masks, mask_indices_list):
         n_global_crops, B, rgb, H, W = global_crops.shape
@@ -695,6 +743,9 @@ class SSLMetaArch(nn.Module):
         mask_indices_list,
         masks_weight,
         iteration,
+        triplet_emb,
+        triplet_labels,
+        triplet_local_indices,
     ):
         n_global_crops = student_global["cls_after_head"].shape[0]
         n_local_crops = student_local["cls_after_head"].shape[0]
@@ -784,7 +835,45 @@ class SSLMetaArch(nn.Module):
                     )
                     loss_dict["stats_only/unmasked_gram_loss"] = gram_loss_unmasked
 
+        # inside compute_losses, where triplet_emb, triplet_labels, triplet_local_indices are available
+        if getattr(self.cfg, "triplet", None) and self.cfg.triplet.enabled and triplet_labels is not None and triplet_emb is not None and triplet_local_indices is not None:
+            try:
+                # TODO: What are the local anchors
+                # anchors: student embeddings (global crop 0). Keep gradient on student anchors.
+                # student_global["cls_pre_head"] shape: [n_global_crops, B, D]
+                student_anchors = student_global["cls_pre_head"][0]  # [B_local, D]
+
+                # Build a deterministic seed: use iteration + rank*10000 -> reproducible across runs.
+                # If you want the same sampling across ranks for the *same* anchors, use only iteration as seed.
+                rank = distributed.get_rank() if hasattr(distributed, "get_rank") else 0
+                seed = int(iteration) + int(rank) * 10000
+
+                triplet_loss_val = self.triplet_loss(
+                    anchors=student_anchors,
+                    global_emb=triplet_emb,
+                    global_labels=triplet_labels,
+                    local_indices=triplet_local_indices,
+                    margin=float(self.cfg.triplet.get("margin", self.triplet_loss.margin)),
+                    seed=seed,
+                )
+
+                loss_dict["triplet_loss"] = triplet_loss_val
+                loss_accumulator += float(self.cfg.triplet.weight) * triplet_loss_val
+            except Exception as err:
+                logger.exception("Triplet loss failed at iteration %s", iteration)
+                logger.exception(f"Unexpected {err=}, {type(err)=}")
+
+
         return loss_accumulator, loss_dict
+    
+# Questions to talk about
+# - Use use_teacher=True for clustering because EMA/teacher embeddings are stable (less noisy clustering). The EMA teacher changes slowly and therefore produces cluster assignments that vary less across iterations — that helps DBSCAN produce sensible clusters instead of oscillating.
+# - Triplet anchors are the student embeddings because we need gradients to update the student. The loss must produce gradients for the network parameters we train. The EMA teacher is typically requires_grad=False (or detached); if you used teacher embeddings as anchors you would not get gradients to update the student (or you'd have to create a new computational graph that forces gradient flow through student in a different way). So the usual pattern is: teacher creates stable clusters/targets, student is trained against them.
+# - Perform clustering on the whole images, or local/global crops?
+# - DBSCAN eps selection matters; heuristics (mean distance ± std)?
+# - If clusters are tiny/rare, triplet signals may be sparse. Small batchsizes make stuff weird
+# - If we scale to very many samples (e.g., whole dataset clustering every epoch), then the memory / compute for DBSCAN may become large
+
 
     @torch.no_grad()
     def gram_load_ema_teacher(self):
