@@ -8,7 +8,11 @@ import logging
 import numpy as np
 from torch import nn
 from torchvision import transforms
-
+import torchvision.transforms.functional as F
+from torchvision.transforms import InterpolationMode
+from PIL import Image
+import numpy as np
+import torch
 from dinov3.data.transforms import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, GaussianBlur, make_normalize_transform
 
 logger = logging.getLogger("dinov3")
@@ -31,6 +35,8 @@ class DataAugmentationDINO(object):
         horizontal_flips=True,
         mean=IMAGENET_DEFAULT_MEAN,
         std=IMAGENET_DEFAULT_STD,
+        mask_as_third_channel: bool = True,  # NEW
+        disable_color_ops_if_mask: bool = True
     ):
         self.global_crops_scale = global_crops_scale
         self.local_crops_scale = local_crops_scale
@@ -45,6 +51,8 @@ class DataAugmentationDINO(object):
         self.share_color_jitter = share_color_jitter
         self.mean = mean
         self.std = std
+        self.mask_as_third_channel = mask_as_third_channel
+        self.disable_color_ops_if_mask = disable_color_ops_if_mask
 
         logger.info("###################################")
         logger.info("Using data augmentation parameters:")
@@ -161,10 +169,76 @@ class DataAugmentationDINO(object):
             )
             self.local_transfo = transforms.Compose([color_jittering, local_transfo_extra, self.normalize])
 
+    def _normalize_tensor(self, x: torch.Tensor, mean, std):
+        # x: C×H×W in [0,1]
+        mean = torch.as_tensor(mean, dtype=x.dtype, device=x.device)[:, None, None]
+        std  = torch.as_tensor(std,  dtype=x.dtype, device=x.device)[:, None, None]
+        return (x - mean) / std
+
+    def _augment_view_mask3c(self, x3: torch.Tensor, out_size: int, scale):
+        # x3: 3×H×W tensor [I, I, M]; I in [0,1], M in {0,1}
+        I2, M = x3[:2], x3[2:3]
+
+        # sample crop once (like RandomResizedCrop)
+        H, W = x3.shape[1:]
+        # emulate get_params using an RGB dummy (only dims matter)
+        dummy = Image.new("RGB", (W, H))
+        i, j, h, w = transforms.RandomResizedCrop.get_params(dummy, scale=scale, ratio=(1.0, 1.0))
+
+        I2 = F.resized_crop(I2, i, j, h, w, (out_size, out_size), interpolation=InterpolationMode.BICUBIC)
+        M  = F.resized_crop(M,  i, j, h, w, (out_size, out_size), interpolation=InterpolationMode.NEAREST)
+
+        # shared horizontal flip
+        if np.random.rand() < 0.5:
+            I2 = F.hflip(I2)
+            M  = F.hflip(M)
+
+        # optional color ops only on intensities
+        if not self.disable_color_ops_if_mask:
+            # ColorJitter & Grayscale on I2 (tensor-safe in torchvision)
+            jitter = transforms.ColorJitter(0.4, 0.4, 0.2, 0.1)
+            I2 = jitter(I2)
+            if np.random.rand() < 0.2:
+                I2 = transforms.RandomGrayscale(p=1.0)(I2)
+            # Blur is fine on I2, skip Solarize (would corrupt mask semantics anyway)
+
+        # normalize (mask channel unchanged semantically)
+        mean = self.mean if len(self.mean) == 3 else [0.5, 0.5, 0.0]
+        std  = self.std  if len(self.std)  == 3 else [0.5, 0.5, 1.0]
+        x3n = torch.cat([I2, M], dim=0)
+        x3n = self._normalize_tensor(x3n, mean=mean, std=std)
+        return x3n
+
     def __call__(self, image):
         output = {}
-        output["weak_flag"] = True  # some residual from mugs
+        output["weak_flag"] = True
 
+        # ---- NEW: mask-aware tensor branch ----
+        if self.mask_as_third_channel and isinstance(image, torch.Tensor):
+            # Expect 3×H×W [I,I,M]
+            # Global crops (2)
+            g1 = self._augment_view_mask3c(image, self.global_crops_size, self.global_crops_scale)
+            g2 = self._augment_view_mask3c(image, self.global_crops_size, self.global_crops_scale)
+            output["global_crops"] = [g1, g2]
+
+            # Teacher crops: either same as student without extra jitter, or same as above
+            if self.teacher_no_color_jitter:
+                # re-augment without extra color ops (we already kept mask clean)
+                t1 = self._augment_view_mask3c(image, self.global_crops_size, self.global_crops_scale)
+                t2 = self._augment_view_mask3c(image, self.global_crops_size, self.global_crops_scale)
+                output["global_crops_teacher"] = [t1, t2]
+            else:
+                output["global_crops_teacher"] = [g1, g2]
+
+            # Local crops
+            locals_ = [self._augment_view_mask3c(image, self.local_crops_size, self.local_crops_scale)
+                    for _ in range(self.local_crops_number)]
+            output["local_crops"] = locals_
+            output["offsets"] = ()
+            # gram teacher crops (optional): skip or mirror g1/g2 sizes if you need them
+            return output
+
+        # ---- original PIL path (RGB) ----
         if self.share_color_jitter:
             image = self.color_jittering(image)
 
@@ -188,8 +262,8 @@ class DataAugmentationDINO(object):
         else:
             output["global_crops_teacher"] = [global_crop_1, global_crop_2]
 
+        # gram teacher crops:
         if self.gram_teacher_crops_size is not None:
-            # crops for gram teacher:
             if self.gram_teacher_no_distortions:
                 gram_crop_1 = self.normalize(self.resize_gram_teacher(im1_base))
                 gram_crop_2 = self.normalize(self.resize_gram_teacher(im2_base))
@@ -203,23 +277,18 @@ class DataAugmentationDINO(object):
             _local_crops = [self.local_transfo(im1_base) for _ in range(self.local_crops_number // 2)] + [
                 self.local_transfo(im2_base) for _ in range(self.local_crops_number // 2)
             ]
-
-            local_crops = []
-            offsets = []
-            gs = self.global_crops_size
-            ls = self.local_crops_size
+            local_crops, offsets = [], []
+            gs, ls = self.global_crops_size, self.local_crops_size
             for img in _local_crops:
                 rx, ry = np.random.randint(0, (gs - ls) // self.patch_size, 2) * self.patch_size
                 local_crops.append(img[:, rx : rx + ls, ry : ry + ls])
                 offsets.append((rx, ry))
-
             output["local_crops"] = local_crops
             output["offsets"] = offsets
         else:
-            local_crops = [
-                self.local_transfo(self.geometric_augmentation_local(image)) for _ in range(self.local_crops_number)
-            ]
-            output["local_crops"] = local_crops
+            output["local_crops"] = [self.local_transfo(self.geometric_augmentation_local(image))
+                                    for _ in range(self.local_crops_number)]
             output["offsets"] = ()
 
         return output
+

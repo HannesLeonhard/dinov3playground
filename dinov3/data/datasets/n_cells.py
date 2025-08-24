@@ -139,6 +139,18 @@ def _derive_label_from_path(img_path: str, root: Path, split: str, origin: str) 
     label_parts = pre + post
     return "__".join(label_parts) if label_parts else ""
 
+# --- add helper for mask ---
+def _load_mask_for_row(mask_dir: str, stem: str) -> Optional[np.ndarray]:
+    """Try common filenames for a binary mask .npy; return HxW uint8 array or None."""
+    for p in _mask_guess_paths(Path(mask_dir), stem):
+        if p.exists():
+            m = np.load(str(p), allow_pickle=False)
+            if m.ndim > 2:
+                m = np.squeeze(m)
+            # ensure binary {0,1} uint8
+            m = (m > 0).astype("uint8")
+            return m
+    return None
 
 # ------------------------- 1) MANIFEST BUILDER (guaranteed labels) -------------------------
 
@@ -316,23 +328,29 @@ class NCells(ExtendedVisionDataset):
         # idx: 0=img_path,1=origin,2=label,3=mask_dir,4=has_empty,5=stem,6=h,7=w,8=area
         self._rows = sel_rows
 
-    def get_image_data(self, index: int) -> bytes:
-        img_path = self._rows[index][0]
+    def get_image_data(self, index: int):
+        img_path, origin, label, mask_dir, has_empty, stem, h, w, area = self._rows[index]
+
+        # Load image → grayscale float32 in [0,1]
         mmap = "r" if self.mmap_images else None
-        img = np.load(img_path, allow_pickle=False, mmap_mode=mmap)  # HxWx3 npy
-        if img.ndim == 2:
-            img = img[..., None]
-        if img.shape[-1] == 1:
-            img = np.repeat(img[..., :1], 3, axis=-1)
-        # Convert floats -> uint8; clip safety
-        if np.issubdtype(img.dtype, np.floating):
-            arr = np.clip(img, 0.0, 1.0)
-            arr = (arr * 255.0).round().astype("uint8")
-        else:
-            arr = img.astype("uint8", copy=False)
-        # Ensure contiguous (PIL likes contiguous arrays)
-        arr = np.ascontiguousarray(arr)
-        return Image.fromarray(arr)  # mode inferred (RGB)
+        img = np.load(img_path, allow_pickle=False, mmap_mode=mmap)  # HxW or HxWxC
+        if img.ndim == 3:
+            img = img[..., 0]  # or img.mean(-1) if you prefer
+        I = (img.astype("float32") / 255.0) if not np.issubdtype(img.dtype, np.floating) else np.clip(img, 0.0, 1.0).astype("float32")
+        H, W = I.shape
+
+        # Load mask -> binary 0/1; fallback to zeros; keep size with NEAREST
+        m = _load_mask_for_row(mask_dir, stem)
+        if m is None:
+            m = np.zeros((H, W), dtype="uint8")
+        if m.shape != (H, W):
+            m = np.array(Image.fromarray(m, mode="L").resize((W, H), Image.NEAREST), dtype="uint8")
+        M = (m > 0).astype("float32")
+
+        # Stack to 3×H×W: [I, I, M]
+        arr3 = np.stack([I, I, M], axis=0).astype("float32")
+        return torch.from_numpy(arr3).contiguous()
+
 
     def get_target(self, index: int) -> str:
         label = self._rows[index][2]
