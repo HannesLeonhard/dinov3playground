@@ -237,11 +237,18 @@ class NCells(ExtendedVisionDataset):
             image_decoder=NCellDecoder,
             target_decoder=TargetDecoder,
         )
+        self.split = split
         self.manifest_csv_gz = str(Path(root).expanduser())
         self.strict_match = True
         self.mmap_images = True
         self.return_paths = False
         self._rng = random.Random(42)
+
+        if self.split == NCells.Split.TEST:
+            flag = self.root.lower().__contains__("test")
+            print("Setup test NCells dataset. Check if the test .csv.gz is provided as manifest file")
+            if not flag:
+                print(f"Warning: Manifest file path does not contain test flag")
 
         allowed = _ALL_DATASETS
 
