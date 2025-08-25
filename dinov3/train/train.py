@@ -26,6 +26,7 @@ from dinov3.checkpointer import (
     load_checkpoint,
     register_dont_save_hooks,
     save_checkpoint,
+    init_fsdp_model_from_checkpoint,
 )
 from dinov3.configs import setup_config, setup_job, setup_multidistillation
 from dinov3.data import (
@@ -415,6 +416,64 @@ def do_train(cfg, model, resume=False):
             )
             + 1
         )
+    finetune_dir = cfg.finetune.path
+    if finetune_dir:
+        logger.info(f"Loading finetuning {finetune_dir}")
+        loaded_iter = load_checkpoint(
+            finetune_dir,
+            model=model,
+            optimizer=None,
+            strict_loading=False,
+            process_group=process_subgroup,
+            
+        )
+        # load_checkpoint returns iteration saved in checkpoint (or None)
+        if loaded_iter is None:
+            logger.info("Finetune checkpoint did not contain an iteration -> treating as pretrained weights.")
+            start_iter = 0
+            loaded_iter = 0
+        else:
+            # Usually for finetune you restart schedules and start_iter at 0
+            # but we keep loaded_iter available for logging
+            logger.info(f"Finetune weights came from checkpoint iteration {loaded_iter + 1}. Starting finetune from iter 0.")
+            start_iter = 0
+        finetune_lr = getattr(cfg.finetune, "lr", None)
+        finetune_epochs = getattr(cfg.finetune, "epochs", None)
+        finetune_wd = getattr(cfg.finetune, "weight_decay", None)
+        if finetune_lr is not None:
+            old_lr = cfg.optim.lr
+            cfg.optim.lr = finetune_lr
+            logger.info(f"Overriding lr for finetune: {old_lr} -> {cfg.optim.lr}")
+        else:
+            # default heuristic: reduce LR by factor 10 when finetuning
+            old_lr = cfg.optim.lr
+            cfg.optim.lr = old_lr * 0.1
+            logger.info(f"No finetune.lr in config; scaled lr {old_lr} -> {cfg.optim.lr}")
+        if finetune_wd is not None:
+            old_wd = cfg.optim.weight_decay
+            cfg.optim.weight_decay = finetune_wd
+            logger.info(f"Overriding weight_decay for finetune: {old_wd} -> {cfg.optim.weight_decay}")
+        if finetune_epochs is not None:
+            old_epochs = cfg.optim.epochs
+            cfg.optim.epochs = finetune_epochs
+            logger.info(f"Overriding epochs for finetune: {old_epochs} -> {cfg.optim.epochs}")
+        optimizer = build_optimizer(cfg, model.get_params_groups())
+        (
+            lr_schedule,
+            wd_schedule,
+            momentum_schedule,
+            teacher_temp_schedule,
+            last_layer_lr_schedule,
+        ) = build_schedulers(cfg)
+        # Apply the schedule to the optimizer so param_group["lr"] is initialized correctly.
+        # For finetuning we typically start at schedule index 0.
+        init_lr = lr_schedule[start_iter]
+        init_wd = wd_schedule[start_iter]
+        init_last_layer_lr = last_layer_lr_schedule[start_iter]
+        apply_optim_scheduler(optimizer, init_lr, init_wd, init_last_layer_lr)
+        logger.info(f"Starting finetuning from iteration {start_iter} with lr={init_lr}, wd={init_wd}")
+    else:
+        loaded_iter = start_iter
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
     if cfg.multidistillation.enabled:
@@ -426,7 +485,7 @@ def do_train(cfg, model, resume=False):
     data_loader = build_multi_resolution_data_loader_from_cfg(
         cfg=cfg,
         model=model,
-        start_iter=start_iter,
+        start_iter=loaded_iter,
     )
     # Setup wandb
     with wandb.init(
@@ -582,7 +641,11 @@ def do_train(cfg, model, resume=False):
                 torch.cuda.synchronize()
 
             # Checkpointing
-            if (iteration + 1) % cfg.checkpointing.period == 0:
+            goal_epoch = getattr(cfg.checkpointing, "checkpointing_goal_epoch", -1)
+            goal_iter = -1
+            if goal_epoch is not None and goal_epoch > -1:
+                goal_iter = OFFICIAL_EPOCH_LENGTH * goal_epoch
+            if (iteration + 1) % cfg.checkpointing.period == 0 or (iteration + 1) == goal_iter:
                 torch.cuda.synchronize()
                 save_checkpoint(
                     ckpt_dir / str(iteration),
@@ -593,7 +656,10 @@ def do_train(cfg, model, resume=False):
                     process_group=process_subgroup,
                 )
                 if distributed.is_subgroup_main_process():
-                    keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
+                    if (iteration + 1) == goal_iter:
+                        logger.info(f"Checkpoint {iteration+1} marked as KEEP (checkpointing_goal).")
+                        keep_checkpoint_copy(ckpt_dir / str(iteration))
+                    keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep, goal_iter=goal_iter)
                     if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
                         keep_checkpoint_copy(ckpt_dir / str(iteration))
 

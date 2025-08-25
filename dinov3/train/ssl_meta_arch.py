@@ -168,7 +168,8 @@ class SSLMetaArch(nn.Module):
                     iter_per_epoch * schedule_cfg.cosine_epochs if "cosine_epochs" in schedule_cfg else None
                 ),
             )
-
+        # triplet
+        self.use_triplet_loss = self.cfg.triplet.enabled
         # Gram
         self.gram_use_loss = self.cfg.gram.use_loss
         self.gram_ema_teacher = False
@@ -415,21 +416,24 @@ class SSLMetaArch(nn.Module):
         # Clustering
         # Cluster based on local and global crops? Compare student and teacher clustering to each other?
         images = data["collated_images"].cuda(non_blocking=True)
-        try:
-            # TODO: What hyperparameters
-            use_teacher = True if self.cfg.triplet.get("cluster_backbone", "teacher") == "teacher" else False
-            # all_emb, all_labels, local_indices = self.get_clustering(images=images,iteration=iteration,use_teacher=use_teacher,eps=self.cfg.triplet.get("clustering_eps", 0.6),min_samples=self.cfg.triplet.get("clustering_min_samples", 4))
-            all_emb, labels_per_eps, centroids_per_eps, centroid_labels_per_eps, local_indices = self.get_hierachical_clustering(
-                images=images,
-                iteration=iteration,
-                use_teacher=use_teacher,
-                min_samples=5,
-                metric="euclidean"
-            )
-        except Exception as err:
-            logger.exception("Clustering invocation failed at iteration %s", iteration)
-            logger.exception(f"Unexpected {err=}, {type(err)=}")
-            all_emb, labels_per_eps, centroids_per_eps, centroid_labels_per_eps, local_indices = None, None, None, None, None
+        if self.use_triplet_loss:
+            try:
+                # TODO: What hyperparameters
+                use_teacher = True if self.cfg.triplet.get("cluster_backbone", "teacher") == "teacher" else False
+                # all_emb, all_labels, local_indices = self.get_clustering(images=images,iteration=iteration,use_teacher=use_teacher,eps=self.cfg.triplet.get("clustering_eps", 0.6),min_samples=self.cfg.triplet.get("clustering_min_samples", 4))
+                clustering_gloabal = self.get_hierachical_clustering(
+                    images=images,
+                    iteration=iteration,
+                    use_teacher=use_teacher,
+                    min_samples=5,
+                    metric="euclidean"
+                )
+            except Exception as err:
+                logger.exception("Clustering invocation failed at iteration %s", iteration)
+                logger.exception(f"Unexpected {err=}, {type(err)=}")
+                clustering_gloabal = {}
+        else:
+            clustering_gloabal = {}
 
         # Compute losses and backprop
         loss_accumulator, loss_dict = self.compute_losses(
@@ -441,11 +445,7 @@ class SSLMetaArch(nn.Module):
             mask_indices_list=mask_indices_list,
             masks_weight=masks_weight,
             iteration=iteration,
-            triplet_emb=all_emb,
-            triplet_local_indices=local_indices,
-            triplet_centroids=centroids_per_eps,
-            triplet_centroid_labels=centroid_labels_per_eps,
-            triplet_labels_per_eps_tensor=labels_per_eps
+            clustering_gloabal=clustering_gloabal,
         )
 
         self.backprop_loss(loss_accumulator)
@@ -714,13 +714,13 @@ class SSLMetaArch(nn.Module):
             local_indices: LongTensor (n_local,) -- indices inside all_emb for this rank's samples
         """
         if images is None:
-            return None, None, None, None, None
+            return {}
 
         # select model container (teacher recommended for stability)
         model_container = self.model_ema if use_teacher else self.student
         if "backbone" not in model_container:
             logger.warning("No backbone found in selected model container for clustering.")
-            return None, None, None, None, None
+            return {}
         backbone = model_container["backbone"]
 
         # device for backbone
@@ -732,7 +732,7 @@ class SSLMetaArch(nn.Module):
             backbone_out = backbone(imgs, is_training=False)
         except Exception as e:
             logger.exception("Backbone forward failed during clustering: %s", e)
-            return None, None, None, None, None
+            return {}
 
         # support backbone returning either a tensor (B, D) or a dict/list
         if isinstance(backbone_out, torch.Tensor):
@@ -743,7 +743,7 @@ class SSLMetaArch(nn.Module):
             emb_local = backbone_out[0]["x_norm_clstoken"]
         else:
             logger.exception("Unexpected backbone return structure for clustering.")
-            return None, None, None, None, None
+            return {}
 
         emb_local = emb_local.detach().contiguous().to(torch.float32)  # [B_local, D]
         emb_local = torch.nn.functional.normalize(emb_local, p=2, dim=1)
@@ -757,7 +757,7 @@ class SSLMetaArch(nn.Module):
                 gathered = [g.cpu() for g in distributed.gather_all_tensors(emb_local.cpu(), group=None)]
             except Exception as e:
                 logger.exception("Failed to gather embeddings for clustering: %s", e)
-                return None, None, None, None, None
+                return {}
 
         # Build all_emb on this rank
         all_emb = torch.cat(gathered, dim=0)  # (N_total, D)
@@ -863,8 +863,14 @@ class SSLMetaArch(nn.Module):
                 centroids_tensor = torch.nn.functional.normalize(centroids_tensor, p=2, dim=1)
             centroids_per_eps.append(centroids_tensor)
             centroid_labels_per_eps.append(cent_label_tensor)
-
-        return all_emb, labels_per_eps, centroids_per_eps, centroid_labels_per_eps, local_indices
+        
+        return {
+            "embed": all_emb,
+            "labels_per_eps": labels_per_eps,
+            "centroids_per_eps": centroids_per_eps,
+            "centroid_labels_per_eps": centroid_labels_per_eps,
+            "local_indices": local_indices,
+        }
 
 
     def get_student_output(self, *, global_crops, local_crops, upperbound, masks, mask_indices_list):
@@ -932,11 +938,7 @@ class SSLMetaArch(nn.Module):
         mask_indices_list,
         masks_weight,
         iteration,
-        triplet_emb,
-        triplet_local_indices,
-        triplet_centroids,
-        triplet_centroid_labels,
-        triplet_labels_per_eps_tensor
+        clustering_gloabal,
     ):
         n_global_crops = student_global["cls_after_head"].shape[0]
         n_local_crops = student_local["cls_after_head"].shape[0]
@@ -1040,13 +1042,12 @@ class SSLMetaArch(nn.Module):
 
                 # mode selection from cfg: batch-hard if cfg.triplet.batch_hard True
                 mode = "batch_hard" if self.cfg.triplet.get("batch_hard", False) else "sample"
-
                 triplet_loss_val, triplet_stats = self.triplet_centroid_loss(
                     anchors=student_anchors,
-                    centroids_per_eps=triplet_centroids,
-                    centroid_labels_per_eps=triplet_centroid_labels,
-                    labels_per_eps=triplet_labels_per_eps_tensor,
-                    local_indices=triplet_local_indices,
+                    centroids_per_eps=clustering_gloabal["centroids_per_eps"],
+                    centroid_labels_per_eps=clustering_gloabal["centroid_labels_per_eps"],
+                    labels_per_eps=clustering_gloabal["labels_per_eps"],
+                    local_indices=clustering_gloabal["local_indices"],
                     margin=float(self.cfg.triplet.get("margin", self.triplet_centroid_loss.margin)),
                 )
                 # triplet_loss_val, triplet_stats = self.triplet_loss(anchors=student_anchors,global_emb=triplet_emb,global_labels=triplet_labels,local_indices=triplet_local_indices,margin=float(self.cfg.triplet.get("margin", self.triplet_loss.margin)),seed=seed,mode=mode,)

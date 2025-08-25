@@ -7,6 +7,11 @@ MODEL:
   DEVICE: cuda
   WEIGHTS: ''
   DTYPE: float32
+finetune:
+  path: '' # '/home/students/code/helmholtzSS25/Hannes/dinov3playground/outputs-finetune/ckpt/123749'
+  lr: 1e-4
+  epochs: 20
+  weight_decay: 0.0
 compute_precision:
   param_dtype: bf16
   reduce_dtype: fp32
@@ -25,7 +30,7 @@ dino:
   koleo_distributed_replicas: 0
   force_weight_norm: false
 triplet:
-  enabled: true
+  enabled: false
   cluser_backbone: student
   margin: 0.2
   weight: 0.1
@@ -153,3 +158,4 @@ evaluation:
 checkpointing:
   period: 3750
   max_to_keep: 3
+  checkpointing_goal_epoch: 80
