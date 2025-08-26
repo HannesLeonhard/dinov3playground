@@ -491,7 +491,7 @@ def do_train(cfg, model, resume=False):
     with wandb.init(
         entity="hannes-leonhard",
         project="ssl-embedding",
-        tags=["dinov3"]
+        tags=["dinov3", "finetuning", "singleCluster"]
     ) as run:
         # Metric logging
         logger.info("Starting training from iteration %d", start_iter)

@@ -772,21 +772,76 @@ class SSLMetaArch(nn.Module):
         local_indices = torch.arange(offset, offset + local_len, dtype=torch.long, device=all_emb.device)
 
         # On main process compute pairwise distances statistics and run DBSCAN for three eps
-        L = 3  # three eps levels: mean-std, mean, mean+std
+        L = 1  # three eps levels: mean-std, mean, mean+std
         labels_list = [None] * L
         if distributed.is_main_process():
             try:
-                all_emb_np = all_emb.cpu().numpy()
                 from sklearn.cluster import DBSCAN
                 from sklearn.metrics import pairwise_distances
-
+                from sklearn.neighbors import NearestNeighbors
+                all_emb_np = all_emb.cpu().numpy()
                 dists = pairwise_distances(all_emb_np, metric=metric)
                 # upper triangle excluding diagonal
                 triu = dists[np.triu_indices_from(dists, k=1)]
                 mean_dist = float(triu.mean()) if triu.size > 0 else float(dists.mean())
                 std_dist = float(triu.std()) if triu.size > 0 else float(dists.std())
 
-                eps_vals = [max(1e-6, mean_dist - std_dist), max(1e-6, mean_dist), max(1e-6, mean_dist + std_dist)]
+                # --- compute eps via k-distance "elbow" (k = min_samples - 1) ---
+                # Choose k for k-distance. For DBSCAN you often use k = min_samples - 1
+                k_for_kdistance = max(1, int(min_samples) - 1)
+
+                # Compute distances to k-th nearest neighbor for every point
+                # NearestNeighbors returns distances including self at index 0 (distance 0.0)
+                nn = NearestNeighbors(n_neighbors=k_for_kdistance + 1, metric=metric, n_jobs=-1)
+                nn.fit(all_emb_np)
+                distances_all, _ = nn.kneighbors(all_emb_np, return_distance=True)
+                # distances_all[:, k_for_kdistance] is the distance to the k-th neighbor (0-based indexing includes self)
+                k_distances = distances_all[:, k_for_kdistance]
+
+                # Sort distances ascending as in the k-distance plot
+                k_dist_sorted = np.sort(k_distances)
+
+                # If too few points, fallback to mean/std based eps
+                def knee_from_sorted(y):
+                    n = len(y)
+                    if n < 3:
+                        return float(np.median(y))
+                    # construct x = 0..n-1
+                    x = np.arange(n).astype(float)
+
+                    # normalize to [0,1] to make distances scale-invariant
+                    x_norm = (x - x[0]) / (x[-1] - x[0]) if x[-1] != x[0] else x
+                    y_norm = (y - y[0]) / (y[-1] - y[0]) if y[-1] != y[0] else y
+
+                    # line vector from first to last
+                    line_vec = np.array([x_norm[-1] - x_norm[0], y_norm[-1] - y_norm[0]])
+                    if np.allclose(line_vec, 0):
+                        return float(y[int(n // 2)])
+                    # point vectors from first point
+                    pts = np.stack([x_norm - x_norm[0], y_norm - y_norm[0]], axis=1)
+                    # perpendicular distance from each point to the line
+                    # cross product magnitude divided by line length
+                    num = np.abs(pts[:, 0] * line_vec[1] - pts[:, 1] * line_vec[0])
+                    denom = np.linalg.norm(line_vec)
+                    perp_dists = num / (denom + 1e-12)
+                    knee_idx = int(np.argmax(perp_dists))
+                    return float(y[knee_idx])
+
+                try:
+                    eps_knee = knee_from_sorted(k_dist_sorted)
+                    # guard against degenerate numeric values
+                    if not np.isfinite(eps_knee) or eps_knee <= 0:
+                        raise RuntimeError("Invalid eps from knee detection")
+                except Exception:
+                    # fallback to heuristic: mean + 0.5*std of pairwise distances
+                    eps_knee = max(1e-6, mean_dist + 0.5 * std_dist)
+
+                # You asked for 3 eps levels around the knee earlier in the code comment.
+                # Use knee and a +/- relative neighborhood as additional robustness:
+                eps_vals = [eps_knee, eps_knee * 0.8, eps_knee * 1.25][:L]
+
+                # If L==1 the list above will be truncated to [eps_knee]
+                # --- run DBSCAN for each eps ---
                 for i, eps_i in enumerate(eps_vals):
                     db = DBSCAN(eps=eps_i, min_samples=min_samples, metric=metric, n_jobs=-1)
                     labels = db.fit_predict(all_emb_np)  # numpy array length N_total: ints

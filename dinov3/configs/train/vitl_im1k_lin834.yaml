@@ -8,7 +8,7 @@ MODEL:
   WEIGHTS: ''
   DTYPE: float32
 finetune:
-  path: '' # '/home/students/code/helmholtzSS25/Hannes/dinov3playground/outputs-finetune/ckpt/123749'
+  path: '/home/students/code/helmholtzSS25/Hannes/dinov3playground/outputs-e80/ckpt/99999_keep'
   lr: 1e-4
   epochs: 20
   weight_decay: 0.0
@@ -30,12 +30,11 @@ dino:
   koleo_distributed_replicas: 0
   force_weight_norm: false
 triplet:
-  enabled: false
+  enabled: true
   cluser_backbone: student
   margin: 0.2
   weight: 0.1
-  clustering_eps: 0.002
-  clustering_min_samples: 2
+  clustering_min_samples: 30
   autoeps: true
   autoeps_mode: "mean"    # "mean", "mean_minus_std", "mean_plus_std"
   batch_hard: false       # legacy option when centroid=false
