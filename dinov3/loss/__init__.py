@@ -9,3 +9,4 @@ from .ibot_patch_loss import iBOTPatchLoss
 from .koleo_loss import KoLeoLoss, KoLeoLossDistributed
 from .tripplet_loss import TripletLoss
 from .tripler_centroid_loss import TripletCentroidLoss
+from .tripplet_hierachical_loss import TripletHCentroidLoss

@@ -12,6 +12,15 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 from torch import Tensor, nn
+import hdbscan
+import warnings
+
+# Silence that specific sklearn FutureWarning coming from older name `force_all_finite`.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*force_all_finite.*",
+    category=FutureWarning,
+)
 
 import dinov3.distributed as distributed
 from dinov3.checkpointer import init_fsdp_model_from_checkpoint
@@ -19,11 +28,12 @@ from dinov3.configs import get_default_config
 from dinov3.data import DataAugmentationDINO
 from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
 from dinov3.layers.dino_head import DINOHead
-from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss, TripletLoss, TripletCentroidLoss
+from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss, TripletLoss, TripletCentroidLoss, TripletHCentroidLoss
 from dinov3.models import build_model_from_cfg
 from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
 from dinov3.utils import count_parameters
+from dinov3.layers.clustering import build_triplet_lists_with_paths
 
 logger = logging.getLogger("dinov3")
 
@@ -83,7 +93,14 @@ class SSLMetaArch(nn.Module):
         teacher_model_dict["dino_head"] = dino_head_class()
         self.dino_loss = DINOLoss(self.dino_out_dim)
         if self.cfg.get("triplet", None) and self.cfg.triplet.enabled:
-            self.triplet_centroid_loss = TripletCentroidLoss(self.cfg.triplet.get("margin", 0.2))
+            self.triplet_loss = TripletHCentroidLoss(
+                margin=self.cfg.triplet.get("margin", 0.2),
+                weighting_mode=self.cfg.triplet.get("weighting_mode", "weighted_mean"),
+                lambda_scaling="global",  # "global" | "local" | None
+                negative_weighting="uniform",  # "uniform" | "inverse_pos" | "based_on_pos" (simple heuristics)
+                eps=1e-8,
+            )
+            # self.triplet_centroid_loss = TripletCentroidLoss(self.cfg.triplet.get("margin", 0.2))
             # self.triplet_loss = TripletLoss(self.cfg.triplet.get("margin", 0.2))
         else:
             self.triplet_loss = None
@@ -421,12 +438,14 @@ class SSLMetaArch(nn.Module):
                 # TODO: What hyperparameters
                 use_teacher = True if self.cfg.triplet.get("cluster_backbone", "teacher") == "teacher" else False
                 # all_emb, all_labels, local_indices = self.get_clustering(images=images,iteration=iteration,use_teacher=use_teacher,eps=self.cfg.triplet.get("clustering_eps", 0.6),min_samples=self.cfg.triplet.get("clustering_min_samples", 4))
-                clustering_gloabal = self.get_hierachical_clustering(
+                # clustering_gloabal = self.get_hierachical_clustering(images=images,iteration=iteration,use_teacher=use_teacher,min_samples=5,metric="euclidean")
+                clustering_gloabal = self.get_hdscan_clustering(
                     images=images,
                     iteration=iteration,
                     use_teacher=use_teacher,
-                    min_samples=5,
-                    metric="euclidean"
+                    min_cluster_size=self.cfg.triplet.get("clustering_min_samples", 30),
+                    min_samples=2,
+                    metric="euclidean",
                 )
             except Exception as err:
                 logger.exception("Clustering invocation failed at iteration %s", iteration)
@@ -926,7 +945,192 @@ class SSLMetaArch(nn.Module):
             "centroid_labels_per_eps": centroid_labels_per_eps,
             "local_indices": local_indices,
         }
+    
+    def get_hdscan_clustering(
+        self,
+        *,
+        images: torch.Tensor | None,
+        iteration: int,
+        use_teacher: bool = False,
+        min_cluster_size: int = 2,
+        min_samples: int = 1,
+        metric: str = "euclidean",
+    ):
+        """
+        Compute embeddings for the provided images, gather across ranks, run HDBSCAN,
+        and build hierarchy-driven triplet data.
 
+        Returns:
+            all_emb: Tensor (N_total, D) -- gathered embeddings (on device)
+            positives: list[list[np.ndarray]] -- parent centroids along each point's path (depth>0)
+            negatives: list[list[np.ndarray]] -- negatives per our hierarchy rules
+            lambdas:   list[list[float]] -- lambda_leave values aligned with positives
+            paths:     dict[int -> list[dict]] -- trimmed paths with QA info (negatives_used on final step)
+            local_indices: LongTensor (n_local,) -- indices into all_emb for this rank's samples
+        """
+        if images is None:
+            return {
+                    "embed": None,
+                    "positives": None,
+                    "negatives": None,
+                    "lambdas": None,
+                    "paths": None,
+                    "local_indices": None,
+                }
+
+        # select model container (teacher recommended for stability)
+        model_container = self.model_ema if use_teacher else self.student
+        if "backbone" not in model_container:
+            logger.warning("No backbone found in selected model container for clustering.")
+            return {
+                    "embed": None,
+                    "positives": None,
+                    "negatives": None,
+                    "lambdas": None,
+                    "paths": None,
+                    "local_indices": None,
+                }
+        backbone = model_container["backbone"]
+
+        # device for backbone
+        device = next(backbone.parameters()).device if any(True for _ in backbone.parameters()) else images.device
+        imgs = images.to(device, non_blocking=True)
+
+        # get per-rank embeddings
+        try:
+            backbone_out = backbone(imgs, is_training=False)
+        except Exception as e:
+            logger.exception("Backbone forward failed during hierarchical clustering: %s", e)
+            return {
+                    "embed": None,
+                    "positives": None,
+                    "negatives": None,
+                    "lambdas": None,
+                    "paths": None,
+                    "local_indices": None,
+                }
+
+        # support backbone returning either a tensor (B, D) or a dict/list
+        if isinstance(backbone_out, torch.Tensor):
+            emb_local = backbone_out  # [B_local, D]
+        elif isinstance(backbone_out, dict) and "x_norm_clstoken" in backbone_out:
+            emb_local = backbone_out["x_norm_clstoken"]
+        elif isinstance(backbone_out, (list, tuple)) and len(backbone_out) > 0 and isinstance(backbone_out[0], dict):
+            emb_local = backbone_out[0]["x_norm_clstoken"]
+        else:
+            logger.exception("Unexpected backbone return structure for hierarchical clustering.")
+            return {
+                    "embed": None,
+                    "positives": None,
+                    "negatives": None,
+                    "lambdas": None,
+                    "paths": None,
+                    "local_indices": None,
+                }
+
+        emb_local = emb_local.detach().contiguous().to(torch.float32)  # [B_local, D]
+        emb_local = torch.nn.functional.normalize(emb_local, p=2, dim=1)
+
+        # Gather embeddings across ranks
+        try:
+            gathered = distributed.gather_all_tensors(emb_local, group=None)
+        except Exception:
+            try:
+                gathered = [g.cpu() for g in distributed.gather_all_tensors(emb_local.cpu(), group=None)]
+            except Exception as e:
+                logger.exception("Failed to gather embeddings for hierarchical clustering: %s", e)
+                return {
+                    "embed": None,
+                    "positives": None,
+                    "negatives": None,
+                    "lambdas": None,
+                    "paths": None,
+                    "local_indices": None,
+                }
+
+        all_emb = torch.cat(gathered, dim=0)  # (N_total, D)
+        N_total = all_emb.shape[0]
+
+        # compute local indices into all_emb
+        rank = distributed.get_rank()
+        offset = 0
+        for r in range(rank):
+            offset += gathered[r].shape[0]
+        local_len = emb_local.shape[0]
+        local_indices = torch.arange(offset, offset + local_len, dtype=torch.long, device=all_emb.device)
+
+        # Everyone can run HDBSCAN locally; all ranks have all_emb, so no broadcast needed
+        try:
+            all_emb_np = all_emb.cpu().numpy()
+            clusterer = hdbscan.HDBSCAN(
+                min_cluster_size=min_cluster_size,
+                min_samples=min_samples,
+                metric=metric,
+                cluster_selection_method='eom',
+                prediction_data=False,
+            ).fit(all_emb_np)
+
+            # Build triplet lists & QA paths
+            positives, negatives, lambdas, paths = build_triplet_lists_with_paths(all_emb_np, clusterer)
+
+            # optional debug saving
+            meta = {
+                "n_points": N_total,
+                "min_cluster_size": min_cluster_size,
+                "min_samples": min_samples,
+                "metric": metric,
+                "use_teacher": use_teacher,
+            }
+            if getattr(self.cfg.triplet, "save_clustering", False):
+                out_dir = Path(self.cfg.train.output_dir) / "clustering_hdbscan" / f"iter_{iteration}"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                np.save(out_dir / "embeddings.npy", all_emb_np)
+                # pickle-like ragged saves (use numpy object arrays)
+                np.save(out_dir / "positives.npy", np.array(positives, dtype=object))
+                np.save(out_dir / "negatives.npy", np.array(negatives, dtype=object))
+                np.save(out_dir / "lambdas.npy",   np.array(lambdas, dtype=object))
+                # save a light JSON for paths (without raw vectors)
+                import json
+                slim_paths = {
+                    int(i): [
+                        {
+                            k: (float(v) if isinstance(v, (np.floating,)) else v)
+                            for k, v in step.items()
+                            if k not in ('parent_centroid','child_centroid','negatives_used')
+                        }
+                        for step in steps
+                    ]
+                    for i, steps in paths.items()
+                }
+                (out_dir / "paths.json").write_text(json.dumps(slim_paths, indent=2))
+                np.save(out_dir / "meta.npy", meta)
+                logger.info(f"[HDBSCAN] iter={iteration}: pts={meta['n_points']} mcs={min_cluster_size} ms={min_samples} -> {out_dir}")
+
+        except Exception as e:
+            logger.exception("HDBSCAN pipeline failed in get_hierachical_clustering at iteration %s: %s", iteration, e)
+            # graceful fallback: empty outputs with correct arity
+            positives = [[] for _ in range(N_total)]
+            negatives = [[] for _ in range(N_total)]
+            lambdas   = [[] for _ in range(N_total)]
+            paths     = {i: [] for i in range(N_total)}
+
+        return {
+            "embed": all_emb,
+            "positives": positives,
+            "negatives": negatives,
+            "lambdas": lambdas,
+            "paths": paths,
+            "local_indices": local_indices,
+        }
+    
+    # triplet_loss_val, triplet_stats = self.triplet_centroid_loss(
+    # anchors=student_anchors,
+    # centroids_per_eps=clustering_gloabal["centroids_per_eps"],
+    # centroid_labels_per_eps=clustering_gloabal["centroid_labels_per_eps"],
+    # labels_per_eps=clustering_gloabal["labels_per_eps"],
+    # local_indices=clustering_gloabal["local_indices"],
+    # centroid_weights_per_eps=clustering_gloabal.get("centroid_weights_per_eps", None),
+    # margin=float(self.cfg.triplet.get("margin", self.triplet_centroid_loss.margin)),
 
     def get_student_output(self, *, global_crops, local_crops, upperbound, masks, mask_indices_list):
         n_global_crops, B, rgb, H, W = global_crops.shape
@@ -1093,17 +1297,17 @@ class SSLMetaArch(nn.Module):
 
                 # deterministic seed using iteration + rank*const
                 rank = distributed.get_rank() if hasattr(distributed, "get_rank") else 0
-                seed = int(iteration) + int(rank) * 10007
+                # seed = int(iteration) + int(rank) * 10007
 
                 # mode selection from cfg: batch-hard if cfg.triplet.batch_hard True
-                mode = "batch_hard" if self.cfg.triplet.get("batch_hard", False) else "sample"
-                triplet_loss_val, triplet_stats = self.triplet_centroid_loss(
+                # mode = "batch_hard" if self.cfg.triplet.get("batch_hard", False) else "sample"
+                triplet_loss_val, triplet_stats = self.triplet_loss(
                     anchors=student_anchors,
-                    centroids_per_eps=clustering_gloabal["centroids_per_eps"],
-                    centroid_labels_per_eps=clustering_gloabal["centroid_labels_per_eps"],
-                    labels_per_eps=clustering_gloabal["labels_per_eps"],
+                    positives=clustering_gloabal["positives"],
+                    negatives=clustering_gloabal["negatives"],
+                    lambdas=clustering_gloabal["lambdas"],
                     local_indices=clustering_gloabal["local_indices"],
-                    margin=float(self.cfg.triplet.get("margin", self.triplet_centroid_loss.margin)),
+                    margin=float(self.cfg.triplet.get("margin", self.triplet_loss.margin)),
                 )
                 # triplet_loss_val, triplet_stats = self.triplet_loss(anchors=student_anchors,global_emb=triplet_emb,global_labels=triplet_labels,local_indices=triplet_local_indices,margin=float(self.cfg.triplet.get("margin", self.triplet_loss.margin)),seed=seed,mode=mode,)
                 loss_dict["triplet_loss"] = triplet_loss_val
@@ -1114,8 +1318,10 @@ class SSLMetaArch(nn.Module):
                 total_anchors = int(triplet_stats.get("total_anchors", student_anchors.shape[0]))
                 loss_dict["triplet/valid_anchors"] = valid_count
                 loss_dict["triplet/total_anchors"] = total_anchors
-                loss_dict["triplet/mode"] = "centroid" if self.cfg.triplet.get("centroid", False) else triplet_stats.get("mode", "sample")
-                logger.info(f"[Triplet] iter={iteration}: mode={loss_dict['triplet/mode']} valid_anchors={valid_count}/{total_anchors}")
+                loss_dict["triplet/weighting_mode"] = triplet_stats.get("weighting_mode", "None")
+                loss_dict["triplet/negative_weighting"] = triplet_stats.get("negative_weighting", "None")
+                loss_dict["triplet/lambda_scaling"] = triplet_stats.get("lambda_scaling", "None")
+                logger.info(f"[Triplet HDBScan] iter={iteration}: negative_weighting={loss_dict['triplet/negative_weighting']} lambda_scaling={loss_dict['triplet/lambda_scaling']} mode={loss_dict['triplet/weighting_mode']} valid_anchors={valid_count}/{total_anchors}")
 
             except Exception as err:
                 logger.exception("Triplet loss failed at iteration %s", iteration)
@@ -1123,12 +1329,12 @@ class SSLMetaArch(nn.Module):
                 loss_dict["triplet_loss"] = 0
                 loss_dict["triplet/valid_anchors"] = 0
                 loss_dict["triplet/total_anchors"] = 0
-                loss_dict["triplet/mode"] = "NaN"
+                loss_dict["triplet/weighting_mode"] = "NaN"
         else:
             loss_dict["triplet_loss"] = 0
             loss_dict["triplet/valid_anchors"] = 0
             loss_dict["triplet/total_anchors"] = 0
-            loss_dict["triplet/mode"] = "NaN"
+            loss_dict["triplet/weighting_mode"] = "NaN"
 
         return loss_accumulator, loss_dict
     

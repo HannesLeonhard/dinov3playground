@@ -491,7 +491,7 @@ def do_train(cfg, model, resume=False):
     with wandb.init(
         entity="hannes-leonhard",
         project="ssl-embedding",
-        tags=["dinov3", "finetuning", "singleCluster"]
+        tags=["dinov3", "finetuning", "hdbscan"]
     ) as run:
         # Metric logging
         logger.info("Starting training from iteration %d", start_iter)
@@ -624,7 +624,6 @@ def do_train(cfg, model, resume=False):
                 #"gram_loss": loss_dict["gram_loss"],
                 "triplet_loss": loss_dict["triplet_loss"],
                 "triplet/valid_anchors": loss_dict["triplet/valid_anchors"],
-                "triplet/total_anchors": loss_dict["triplet/total_anchors"]
             })
             metric_logger.update(lr=lr)
             metric_logger.update(wd=wd)
