@@ -9,7 +9,8 @@ from torchvision.datasets import VisionDataset
 
 from .decoders import Decoder, ImageDataDecoder, TargetDecoder
 
-
+import torch
+from torchvision.transforms.functional import to_pil_image
 class ExtendedVisionDataset(VisionDataset):
     def __init__(
         self,
@@ -34,6 +35,11 @@ class ExtendedVisionDataset(VisionDataset):
             image = self.image_decoder(image_data).decode()
         except Exception as e:
             raise RuntimeError(f"can not read image for sample {index}") from e
+        
+                # ---- Fix: make sure transforms get a PIL image if they expect one ----
+        if isinstance(image, torch.Tensor):
+            # to_pil_image handles CHW/HWC and uint8 or float in [0, 1]
+            image = to_pil_image(image)
         target = self.get_target(index)
         target = self.target_decoder(target).decode()
 
