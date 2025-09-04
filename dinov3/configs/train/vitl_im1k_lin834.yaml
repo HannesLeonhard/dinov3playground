@@ -141,3 +141,7 @@ evaluation:
 checkpointing:
   period: 3750
   max_to_keep: 3
+#for the new segmentation teacher student loss
+seg:
+  enabled: true
+  loss_weight: 0.1   

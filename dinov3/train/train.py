@@ -430,8 +430,8 @@ def do_train(cfg, model, resume=False):
     )
     # Setup wandb
     with wandb.init(
-        entity="hannes-leonhard",
-        project="ssl-embedding",
+        entity="anirudh027-ludwig-maximilianuniversity-of-munich",
+        project="dinov3-double-teacher",
         tags=["dinov3"]
     ) as run:
         # Metric logging
@@ -557,6 +557,7 @@ def do_train(cfg, model, resume=False):
                 "mom": mom,
                 "last_layer_lr": last_layer_lr,
                 "total_loss": total_loss,
+                "metrics": metrics_dict,
             })
             metric_logger.update(lr=lr)
             metric_logger.update(wd=wd)
