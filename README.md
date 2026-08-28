@@ -35,8 +35,6 @@ The dataset can be downloaded [here](https://huggingface.co/datasets/tum-ai/HASS
 
 Pretrained HASSL checkpoints can be downloaded [here](https://mega.nz/folder/sF1UhLSC#YCgp5avkM7ULTMmGXrLdyw).
 
-Pass a downloaded checkpoint to `finetune.path` to fine-tune from it (see [Fine-tuning from a Checkpoint](#fine-tuning-from-a-checkpoint)).
-
 ---
 
 ## Installation
