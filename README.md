@@ -5,7 +5,7 @@
   <em>Figure 1: Hierarchy in cell imaging (left) and the embedding objective with HASSL (right). HASSL learns a more hierarchical embedding space, leading to improved morphological representation and tighter subclusters.</em>
 </p>
 
-[ :scroll: [`Paper`](#)] [ :book: [`BibTeX`](#citing-this-work)]
+[ :scroll: [`Paper`](#)] [ :floppy_disk: [`Weights`](https://mega.nz/folder/sF1UhLSC#YCgp5avkM7ULTMmGXrLdyw)] [ :book: [`BibTeX`](#citing-this-work)]
 
 Biological cell images present a distinct challenge for self-supervised learning: coarse imaging factors (acquisition modality, staining protocol) systematically dominate the learned representation, overwhelming the fine morphological signals that distinguish biologically distinct subtypes. The result is a latent space where semantically different cells appear identical and hierarchically related subtypes collapse into the same cluster.
 
@@ -28,6 +28,14 @@ Together, these two components push the embedding space toward a structure that 
 ## Dataset
 
 The dataset can be downloaded [here](https://huggingface.co/datasets/tum-ai/HASSL-SingleCellBench)
+
+---
+
+## Pretrained Weights
+
+Pretrained HASSL checkpoints can be downloaded [here](https://mega.nz/folder/sF1UhLSC#YCgp5avkM7ULTMmGXrLdyw).
+
+Pass a downloaded checkpoint to `finetune.path` to fine-tune from it (see [Fine-tuning from a Checkpoint](#fine-tuning-from-a-checkpoint)).
 
 ---
 
@@ -161,7 +169,7 @@ Leave `finetune.path=''` to train from scratch.
 
 ### Fine-tuning from a Checkpoint
 
-To resume from or fine-tune an existing checkpoint — for example, to apply the HDBSCAN contrastive loss on top of the Double Teacher checkpoint — set `finetune.path` to the checkpoint path:
+To resume from or fine-tune an existing checkpoint — for example, to apply the HDBSCAN contrastive loss on top of the Double Teacher checkpoint — set `finetune.path` to the checkpoint path. Our released checkpoints are available [here](https://mega.nz/folder/sF1UhLSC#YCgp5avkM7ULTMmGXrLdyw):
 
 ```shell
 PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/train/train.py \
